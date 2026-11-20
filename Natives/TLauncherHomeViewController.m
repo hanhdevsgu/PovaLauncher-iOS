@@ -24,28 +24,28 @@ static NSString * const PovaTargetVersion = @"1.12.2";
 @interface TLauncherHomeViewController () <UITextFieldDelegate, UIDocumentPickerDelegate, UIPopoverPresentationControllerDelegate>
 
 @property(nonatomic) UIView *headerView;
-@property(nonatomic) UIView *versionBadgeView;
-@property(nonatomic) UILabel *versionBadgeLabel;
-@property(nonatomic) UILabel *statusPillLabel;
-@property(nonatomic) UILabel *rendererValueLabel;
-@property(nonatomic) UILabel *ramValueLabel;
-@property(nonatomic) UILabel *jitValueLabel;
-@property(nonatomic) UIButton *controlsResetButton;
+@property(nonatomic) UIView *launchCard;
+@property(nonatomic) NSLayoutConstraint *cardCenterYConstraint;
 
-@property(nonatomic) UIView *dockView;
 @property(nonatomic) UIImageView *avatarImageView;
 @property(nonatomic) UITextField *usernameField;
 @property(nonatomic) UIButton *accountListButton;
+
+@property(nonatomic) UIStackView *idleVersionStack;
 @property(nonatomic) UILabel *versionTitleLabel;
-@property(nonatomic) UILabel *uuidPreviewLabel;
+@property(nonatomic) UILabel *versionSubtitleLabel;
+
+@property(nonatomic) UIStackView *progressStack;
 @property(nonatomic) UIProgressView *downloadProgressView;
 @property(nonatomic) UILabel *downloadStatusLabel;
 @property(nonatomic) UIButton *detailsButton;
+
 @property(nonatomic) UIButton *playButton;
 
 @property(nonatomic) MinecraftResourceDownloadTask *downloadTask;
 @property(nonatomic) UINavigationController *progressVC;
 @property(nonatomic) BOOL isObservingProgress;
+@property(nonatomic, assign) volatile BOOL cancelledJITWait;
 @property(nonatomic) UIAlertController *jitWaitAlert;
 @property(nonatomic) NSTimeInterval lastSpeedSampleTime;
 @property(nonatomic) int64_t lastCompletedBytes;
@@ -54,7 +54,7 @@ static NSString * const PovaTargetVersion = @"1.12.2";
 
 @implementation TLauncherHomeViewController
 
-#pragma mark - Theme Palette & Scale
+#pragma mark - Theme Palette
 
 + (UIColor *)bgObsidian { return [UIColor colorWithRed:0.059 green:0.078 blue:0.098 alpha:1.0]; }     // #0F1419
 + (UIColor *)surfaceSlate { return [UIColor colorWithRed:0.090 green:0.118 blue:0.149 alpha:1.0]; }   // #171E26
@@ -64,7 +64,6 @@ static NSString * const PovaTargetVersion = @"1.12.2";
 + (UIColor *)textMuted { return [UIColor colorWithRed:0.541 green:0.588 blue:0.659 alpha:1.0]; }      // #8A96A8
 + (UIColor *)emeraldPrimary { return [UIColor colorWithRed:0.180 green:0.627 blue:0.263 alpha:1.0]; } // #2EA043
 + (UIColor *)emeraldBright { return [UIColor colorWithRed:0.247 green:0.725 blue:0.314 alpha:1.0]; }  // #3FB950
-+ (UIColor *)amberAccent { return [UIColor colorWithRed:0.824 green:0.600 blue:0.133 alpha:1.0]; }    // #D29922
 
 #pragma mark - Lifecycle
 
@@ -77,6 +76,7 @@ static NSString * const PovaTargetVersion = @"1.12.2";
 }
 
 - (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self stopObservingDownloadProgress];
 }
 
@@ -84,26 +84,43 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     [super viewDidLoad];
     self.view.backgroundColor = [TLauncherHomeViewController bgObsidian];
 
-    // Ensure non-demo GameDir environment
+    // Ensure clean non-demo GameDir environment
     unsetenv("DEMO_LOCK");
     if (getenv("AME_HOME")) {
         NSString *defaultGameDir = [NSString stringWithFormat:@"%s/Library/Application Support/minecraft", getenv("AME_HOME")];
         setenv("GAME_DIR", defaultGameDir.UTF8String, 1);
     }
 
-    [self setupLayout];
+    [self setupMinimalTLauncherLayout];
     [self restoreInitialOfflineAccount];
-    [self refreshDashboardState];
-    [self updateUUIDPreview];
+    [self refreshVersionSubtitle];
 
     UITapGestureRecognizer *dismissTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dismissKeyboard)];
     dismissTap.cancelsTouchesInView = NO;
     [self.view addGestureRecognizer:dismissTap];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleKeyboardFrameNotification:)
+                                                 name:UIKeyboardWillChangeFrameNotification
+                                               object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleKeyboardHideNotification:)
+                                                 name:UIKeyboardWillHideNotification
+                                               object:nil];
+
+    // Background AltKit discovery for iOS <= 16.x AltStore/SideStore Wi-Fi JIT
+    if (!isJITEnabled(false) && getEntitlementValue(@"get-task-allow")) {
+        if (@available(iOS 17.0, *)) {
+            // iOS 17+ JIT triggered on Play via StikJIT/SideStore/AltServer
+        } else {
+            [self tryAltKitEnableJITSilently];
+        }
+    }
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    [self refreshDashboardState];
+    [self refreshVersionSubtitle];
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -111,15 +128,15 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     if ([getPrefObject(@"control.control_safe_area") length] == 0) {
         setPrefObject(@"control.control_safe_area", NSStringFromUIEdgeInsets(getDefaultSafeArea()));
     }
-    [self refreshDashboardState];
+    [self refreshVersionSubtitle];
 }
 
-#pragma mark - UI Construction
+#pragma mark - Minimalist TLauncher UI (Center Stage + Keyboard Safe)
 
-- (void)setupLayout {
+- (void)setupMinimalTLauncherLayout {
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
 
-    // 1. Top Header Bar
+    // 1. Clean Top Bar (44pt tall)
     self.headerView = [UIView new];
     self.headerView.translatesAutoresizingMaskIntoConstraints = NO;
     self.headerView.backgroundColor = [TLauncherHomeViewController surfaceSlate];
@@ -141,30 +158,33 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     UILabel *brandTitle = [UILabel new];
     brandTitle.translatesAutoresizingMaskIntoConstraints = NO;
     brandTitle.text = @"POVALAUNCHER";
-    brandTitle.font = [UIFont systemFontOfSize:16 weight:UIFontWeightHeavy];
+    brandTitle.font = [UIFont systemFontOfSize:15 weight:UIFontWeightHeavy];
     brandTitle.textColor = [TLauncherHomeViewController textPrimary];
 
-    self.versionBadgeView = [UIView new];
-    self.versionBadgeView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.versionBadgeView.backgroundColor = [[TLauncherHomeViewController emeraldPrimary] colorWithAlphaComponent:0.18];
-    self.versionBadgeView.layer.cornerRadius = 6;
-    self.versionBadgeView.layer.borderWidth = 1;
-    self.versionBadgeView.layer.borderColor = [[TLauncherHomeViewController emeraldBright] colorWithAlphaComponent:0.45].CGColor;
+    UIView *versionBadge = [UIView new];
+    versionBadge.translatesAutoresizingMaskIntoConstraints = NO;
+    versionBadge.backgroundColor = [[TLauncherHomeViewController emeraldPrimary] colorWithAlphaComponent:0.18];
+    versionBadge.layer.cornerRadius = 6;
+    versionBadge.layer.borderWidth = 1;
+    versionBadge.layer.borderColor = [[TLauncherHomeViewController emeraldBright] colorWithAlphaComponent:0.4].CGColor;
 
-    self.versionBadgeLabel = [UILabel new];
-    self.versionBadgeLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.versionBadgeLabel.text = @"1.12.2";
-    self.versionBadgeLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightBold];
-    self.versionBadgeLabel.textColor = [TLauncherHomeViewController emeraldBright];
-    [self.versionBadgeView addSubview:self.versionBadgeLabel];
+    UILabel *versionBadgeLabel = [UILabel new];
+    versionBadgeLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    versionBadgeLabel.text = @"1.12.2";
+    versionBadgeLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightBold];
+    versionBadgeLabel.textColor = [TLauncherHomeViewController emeraldBright];
+    [versionBadge addSubview:versionBadgeLabel];
     [NSLayoutConstraint activateConstraints:@[
-        [self.versionBadgeLabel.topAnchor constraintEqualToAnchor:self.versionBadgeView.topAnchor constant:3],
-        [self.versionBadgeLabel.bottomAnchor constraintEqualToAnchor:self.versionBadgeView.bottomAnchor constant:-3],
-        [self.versionBadgeLabel.leadingAnchor constraintEqualToAnchor:self.versionBadgeView.leadingAnchor constant:7],
-        [self.versionBadgeLabel.trailingAnchor constraintEqualToAnchor:self.versionBadgeView.trailingAnchor constant:-7],
+        [versionBadgeLabel.topAnchor constraintEqualToAnchor:versionBadge.topAnchor constant:2],
+        [versionBadgeLabel.bottomAnchor constraintEqualToAnchor:versionBadge.bottomAnchor constant:-2],
+        [versionBadgeLabel.leadingAnchor constraintEqualToAnchor:versionBadge.leadingAnchor constant:7],
+        [versionBadgeLabel.trailingAnchor constraintEqualToAnchor:versionBadge.trailingAnchor constant:-7],
     ]];
 
     UIButton *btnControls = [self makeToolbarButtonWithTitle:@"Điều khiển" icon:@"gamecontroller.fill" action:@selector(actionOpenControls)];
+    UILongPressGestureRecognizer *resetHold = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(actionHoldResetControls:)];
+    [btnControls addGestureRecognizer:resetHold];
+
     UIButton *btnInstallJar = [self makeToolbarButtonWithTitle:@"Cài .jar" icon:@"shippingbox.fill" action:@selector(actionOpenJarInstaller)];
     UIButton *btnSettings = [self makeToolbarButtonWithTitle:@"Cài đặt" icon:@"gearshape.fill" action:@selector(actionOpenSettings)];
     UIButton *btnLogs = [self makeToolbarButtonWithTitle:@"Nhật ký" icon:@"doc.text.fill" action:@selector(actionOpenLogs)];
@@ -172,32 +192,34 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     UIStackView *toolbarStack = [[UIStackView alloc] initWithArrangedSubviews:@[btnControls, btnInstallJar, btnSettings, btnLogs]];
     toolbarStack.translatesAutoresizingMaskIntoConstraints = NO;
     toolbarStack.axis = UILayoutConstraintAxisHorizontal;
-    toolbarStack.spacing = 8;
+    toolbarStack.spacing = 6;
 
     [self.headerView addSubview:brandIcon];
     [self.headerView addSubview:brandTitle];
-    [self.headerView addSubview:self.versionBadgeView];
+    [self.headerView addSubview:versionBadge];
     [self.headerView addSubview:toolbarStack];
 
-    // 2. Bottom TLauncher Dock
-    self.dockView = [UIView new];
-    self.dockView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.dockView.backgroundColor = [TLauncherHomeViewController surfaceSlate];
-    [self.view addSubview:self.dockView];
+    // 2. Stage Guide (Space below header)
+    UILayoutGuide *stageGuide = [UILayoutGuide new];
+    [self.view addLayoutGuide:stageGuide];
 
-    UIView *dockDivider = [UIView new];
-    dockDivider.translatesAutoresizingMaskIntoConstraints = NO;
-    dockDivider.backgroundColor = [TLauncherHomeViewController borderHairline];
-    [self.dockView addSubview:dockDivider];
+    // 3. Single Clean Centered TLauncher Card
+    self.launchCard = [UIView new];
+    self.launchCard.translatesAutoresizingMaskIntoConstraints = NO;
+    self.launchCard.backgroundColor = [TLauncherHomeViewController surfaceSlate];
+    self.launchCard.layer.cornerRadius = 14;
+    self.launchCard.layer.borderWidth = 1;
+    self.launchCard.layer.borderColor = [TLauncherHomeViewController borderHairline].CGColor;
+    [self.view addSubview:self.launchCard];
 
-    // Account Box
+    // Row 1: Offline Username Box
     UIView *accountContainer = [UIView new];
     accountContainer.translatesAutoresizingMaskIntoConstraints = NO;
     accountContainer.backgroundColor = [TLauncherHomeViewController bgObsidian];
     accountContainer.layer.cornerRadius = 10;
     accountContainer.layer.borderWidth = 1;
     accountContainer.layer.borderColor = [TLauncherHomeViewController borderHairline].CGColor;
-    [self.dockView addSubview:accountContainer];
+    [self.launchCard addSubview:accountContainer];
 
     self.avatarImageView = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"DefaultAccount"]];
     self.avatarImageView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -209,10 +231,10 @@ static NSString * const PovaTargetVersion = @"1.12.2";
 
     self.usernameField = [UITextField new];
     self.usernameField.translatesAutoresizingMaskIntoConstraints = NO;
-    self.usernameField.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    self.usernameField.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     self.usernameField.textColor = [TLauncherHomeViewController textPrimary];
     self.usernameField.attributedPlaceholder = [[NSAttributedString alloc]
-        initWithString:@"Tên Offline (3-16 ký tự)"
+        initWithString:@"Nhập tên nhân vật (3-16 ký tự)"
             attributes:@{NSForegroundColorAttributeName: [TLauncherHomeViewController textMuted]}];
     self.usernameField.autocorrectionType = UITextAutocorrectionTypeNo;
     self.usernameField.autocapitalizationType = UITextAutocapitalizationTypeNone;
@@ -220,7 +242,6 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     self.usernameField.returnKeyType = UIReturnKeyDone;
     self.usernameField.clearButtonMode = UITextFieldViewModeWhileEditing;
     self.usernameField.delegate = self;
-    [self.usernameField addTarget:self action:@selector(usernameTextChanged:) forControlEvents:UIControlEventEditingChanged];
 
     self.accountListButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.accountListButton.translatesAutoresizingMaskIntoConstraints = NO;
@@ -233,54 +254,51 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     [accountContainer addSubview:self.usernameField];
     [accountContainer addSubview:self.accountListButton];
 
-    // Fixed Version & Progress Center Block
-    UIView *versionContainer = [UIView new];
-    versionContainer.translatesAutoresizingMaskIntoConstraints = NO;
-    versionContainer.backgroundColor = [TLauncherHomeViewController bgObsidian];
-    versionContainer.layer.cornerRadius = 10;
-    versionContainer.layer.borderWidth = 1;
-    versionContainer.layer.borderColor = [TLauncherHomeViewController borderHairline].CGColor;
-    [self.dockView addSubview:versionContainer];
-
+    // Row 2 Left: Version Info OR Progress Bar
     self.versionTitleLabel = [UILabel new];
-    self.versionTitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.versionTitleLabel.text = @"Release 1.12.2 (Cố định)";
-    self.versionTitleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
+    self.versionTitleLabel.text = @"Release 1.12.2";
+    self.versionTitleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightBold];
     self.versionTitleLabel.textColor = [TLauncherHomeViewController textPrimary];
 
-    self.uuidPreviewLabel = [UILabel new];
-    self.uuidPreviewLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.uuidPreviewLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
-    self.uuidPreviewLabel.textColor = [TLauncherHomeViewController textMuted];
-    self.uuidPreviewLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    self.versionSubtitleLabel = [UILabel new];
+    self.versionSubtitleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    self.versionSubtitleLabel.textColor = [TLauncherHomeViewController textMuted];
+    self.versionSubtitleLabel.text = @"Offline • Sẵn sàng vào server PC";
 
-    self.downloadProgressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
-    self.downloadProgressView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.downloadProgressView.progressTintColor = [TLauncherHomeViewController emeraldBright];
-    self.downloadProgressView.trackTintColor = [TLauncherHomeViewController borderHairline];
-    self.downloadProgressView.hidden = YES;
+    self.idleVersionStack = [[UIStackView alloc] initWithArrangedSubviews:@[self.versionTitleLabel, self.versionSubtitleLabel]];
+    self.idleVersionStack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.idleVersionStack.axis = UILayoutConstraintAxisVertical;
+    self.idleVersionStack.spacing = 2;
+    [self.launchCard addSubview:self.idleVersionStack];
 
     self.downloadStatusLabel = [UILabel new];
-    self.downloadStatusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.downloadStatusLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
     self.downloadStatusLabel.textColor = [TLauncherHomeViewController emeraldBright];
-    self.downloadStatusLabel.hidden = YES;
 
     self.detailsButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.detailsButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.detailsButton setTitle:@"Chi tiết" forState:UIControlStateNormal];
-    self.detailsButton.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     [self.detailsButton setTitleColor:[TLauncherHomeViewController emeraldBright] forState:UIControlStateNormal];
-    self.detailsButton.hidden = YES;
+    self.detailsButton.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    [self.detailsButton setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [self.detailsButton addTarget:self action:@selector(actionShowDownloadDetails:) forControlEvents:UIControlEventTouchUpInside];
 
-    [versionContainer addSubview:self.versionTitleLabel];
-    [versionContainer addSubview:self.uuidPreviewLabel];
-    [versionContainer addSubview:self.downloadProgressView];
-    [versionContainer addSubview:self.downloadStatusLabel];
-    [versionContainer addSubview:self.detailsButton];
+    UIStackView *progTopRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.downloadStatusLabel, self.detailsButton]];
+    progTopRow.axis = UILayoutConstraintAxisHorizontal;
+    progTopRow.spacing = 6;
+    progTopRow.alignment = UIStackViewAlignmentCenter;
 
-    // Emerald Play Button
+    self.downloadProgressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+    self.downloadProgressView.progressTintColor = [TLauncherHomeViewController emeraldBright];
+    self.downloadProgressView.trackTintColor = [TLauncherHomeViewController borderHairline];
+
+    self.progressStack = [[UIStackView alloc] initWithArrangedSubviews:@[progTopRow, self.downloadProgressView]];
+    self.progressStack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.progressStack.axis = UILayoutConstraintAxisVertical;
+    self.progressStack.spacing = 6;
+    self.progressStack.hidden = YES;
+    [self.launchCard addSubview:self.progressStack];
+
+    // Row 2 Right: Emerald Play Button
     self.playButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.playButton.translatesAutoresizingMaskIntoConstraints = NO;
     self.playButton.backgroundColor = [TLauncherHomeViewController emeraldPrimary];
@@ -293,32 +311,19 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     self.playButton.tintColor = UIColor.whiteColor;
     self.playButton.imageEdgeInsets = UIEdgeInsetsMake(0, -6, 0, 6);
     [self.playButton addTarget:self action:@selector(actionPlayPressed:) forControlEvents:UIControlEventTouchUpInside];
-    [self.dockView addSubview:self.playButton];
+    [self.launchCard addSubview:self.playButton];
 
-    // 3. Scrollable Center Dashboard
-    UIScrollView *centerScroll = [UIScrollView new];
-    centerScroll.translatesAutoresizingMaskIntoConstraints = NO;
-    centerScroll.showsVerticalScrollIndicator = NO;
-    centerScroll.alwaysBounceVertical = NO;
-    [self.view addSubview:centerScroll];
+    self.cardCenterYConstraint = [self.launchCard.centerYAnchor constraintEqualToAnchor:stageGuide.centerYAnchor constant:0];
 
-    UIView *leftCard = [self buildEngineStatusCard];
-    UIView *rightCard = [self buildMultiplayerGuideCard];
-
-    UIStackView *cardsRow = [[UIStackView alloc] initWithArrangedSubviews:@[leftCard, rightCard]];
-    cardsRow.translatesAutoresizingMaskIntoConstraints = NO;
-    cardsRow.axis = UILayoutConstraintAxisHorizontal;
-    cardsRow.spacing = 12;
-    cardsRow.alignment = UIStackViewAlignmentFill;
-    cardsRow.distribution = UIStackViewDistributionFill;
-    [centerScroll addSubview:cardsRow];
+    NSLayoutConstraint *preferredWidth = [self.launchCard.widthAnchor constraintEqualToConstant:440];
+    preferredWidth.priority = UILayoutPriorityDefaultHigh;
 
     [NSLayoutConstraint activateConstraints:@[
-        // Header bar pinned top
+        // Header bar
         [self.headerView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
         [self.headerView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [self.headerView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [self.headerView.heightAnchor constraintEqualToConstant:50],
+        [self.headerView.heightAnchor constraintEqualToConstant:44],
 
         [headerDivider.leadingAnchor constraintEqualToAnchor:self.headerView.leadingAnchor],
         [headerDivider.trailingAnchor constraintEqualToAnchor:self.headerView.trailingAnchor],
@@ -327,357 +332,146 @@ static NSString * const PovaTargetVersion = @"1.12.2";
 
         [brandIcon.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [brandIcon.centerYAnchor constraintEqualToAnchor:self.headerView.centerYAnchor],
-        [brandIcon.widthAnchor constraintEqualToConstant:26],
-        [brandIcon.heightAnchor constraintEqualToConstant:26],
+        [brandIcon.widthAnchor constraintEqualToConstant:24],
+        [brandIcon.heightAnchor constraintEqualToConstant:24],
 
         [brandTitle.leadingAnchor constraintEqualToAnchor:brandIcon.trailingAnchor constant:8],
         [brandTitle.centerYAnchor constraintEqualToAnchor:self.headerView.centerYAnchor],
 
-        [self.versionBadgeView.leadingAnchor constraintEqualToAnchor:brandTitle.trailingAnchor constant:8],
-        [self.versionBadgeView.centerYAnchor constraintEqualToAnchor:self.headerView.centerYAnchor],
+        [versionBadge.leadingAnchor constraintEqualToAnchor:brandTitle.trailingAnchor constant:7],
+        [versionBadge.centerYAnchor constraintEqualToAnchor:self.headerView.centerYAnchor],
 
         [toolbarStack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [toolbarStack.centerYAnchor constraintEqualToAnchor:self.headerView.centerYAnchor],
-        [toolbarStack.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.versionBadgeView.trailingAnchor constant:10],
+        [toolbarStack.leadingAnchor constraintGreaterThanOrEqualToAnchor:versionBadge.trailingAnchor constant:8],
 
-        // Dock pinned bottom
-        [self.dockView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [self.dockView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [self.dockView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        // Stage guide
+        [stageGuide.topAnchor constraintEqualToAnchor:self.headerView.bottomAnchor],
+        [stageGuide.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+        [stageGuide.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+        [stageGuide.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor],
 
-        [dockDivider.topAnchor constraintEqualToAnchor:self.dockView.topAnchor],
-        [dockDivider.leadingAnchor constraintEqualToAnchor:self.dockView.leadingAnchor],
-        [dockDivider.trailingAnchor constraintEqualToAnchor:self.dockView.trailingAnchor],
-        [dockDivider.heightAnchor constraintEqualToConstant:1],
+        // Centered Launch Card
+        [self.launchCard.centerXAnchor constraintEqualToAnchor:stageGuide.centerXAnchor],
+        self.cardCenterYConstraint,
+        preferredWidth,
+        [self.launchCard.leadingAnchor constraintGreaterThanOrEqualToAnchor:safe.leadingAnchor constant:16],
+        [self.launchCard.trailingAnchor constraintLessThanOrEqualToAnchor:safe.trailingAnchor constant:-16],
 
-        [accountContainer.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [accountContainer.topAnchor constraintEqualToAnchor:self.dockView.topAnchor constant:10],
-        [accountContainer.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10],
-        [accountContainer.heightAnchor constraintEqualToConstant:44],
-        [accountContainer.widthAnchor constraintGreaterThanOrEqualToConstant:200],
-        [accountContainer.widthAnchor constraintEqualToAnchor:safe.widthAnchor multiplier:0.35],
+        // Username row inside card
+        [accountContainer.topAnchor constraintEqualToAnchor:self.launchCard.topAnchor constant:14],
+        [accountContainer.leadingAnchor constraintEqualToAnchor:self.launchCard.leadingAnchor constant:14],
+        [accountContainer.trailingAnchor constraintEqualToAnchor:self.launchCard.trailingAnchor constant:-14],
+        [accountContainer.heightAnchor constraintEqualToConstant:46],
 
-        [self.avatarImageView.leadingAnchor constraintEqualToAnchor:accountContainer.leadingAnchor constant:8],
+        [self.avatarImageView.leadingAnchor constraintEqualToAnchor:accountContainer.leadingAnchor constant:9],
         [self.avatarImageView.centerYAnchor constraintEqualToAnchor:accountContainer.centerYAnchor],
         [self.avatarImageView.widthAnchor constraintEqualToConstant:28],
         [self.avatarImageView.heightAnchor constraintEqualToConstant:28],
 
-        [self.usernameField.leadingAnchor constraintEqualToAnchor:self.avatarImageView.trailingAnchor constant:8],
+        [self.usernameField.leadingAnchor constraintEqualToAnchor:self.avatarImageView.trailingAnchor constant:10],
         [self.usernameField.centerYAnchor constraintEqualToAnchor:accountContainer.centerYAnchor],
-        [self.usernameField.trailingAnchor constraintEqualToAnchor:self.accountListButton.leadingAnchor constant:-4],
+        [self.usernameField.trailingAnchor constraintEqualToAnchor:self.accountListButton.leadingAnchor constant:-6],
 
         [self.accountListButton.trailingAnchor constraintEqualToAnchor:accountContainer.trailingAnchor constant:-6],
         [self.accountListButton.centerYAnchor constraintEqualToAnchor:accountContainer.centerYAnchor],
-        [self.accountListButton.widthAnchor constraintEqualToConstant:30],
-        [self.accountListButton.heightAnchor constraintEqualToConstant:30],
+        [self.accountListButton.widthAnchor constraintEqualToConstant:32],
+        [self.accountListButton.heightAnchor constraintEqualToConstant:32],
 
-        [self.playButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.playButton.topAnchor constraintEqualToAnchor:self.dockView.topAnchor constant:10],
-        [self.playButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10],
-        [self.playButton.widthAnchor constraintEqualToConstant:168],
+        // Play button bottom-right inside card
+        [self.playButton.topAnchor constraintEqualToAnchor:accountContainer.bottomAnchor constant:12],
+        [self.playButton.trailingAnchor constraintEqualToAnchor:self.launchCard.trailingAnchor constant:-14],
+        [self.playButton.bottomAnchor constraintEqualToAnchor:self.launchCard.bottomAnchor constant:-14],
+        [self.playButton.widthAnchor constraintEqualToConstant:164],
+        [self.playButton.heightAnchor constraintEqualToConstant:42],
 
-        [versionContainer.leadingAnchor constraintEqualToAnchor:accountContainer.trailingAnchor constant:10],
-        [versionContainer.trailingAnchor constraintEqualToAnchor:self.playButton.leadingAnchor constant:-10],
-        [versionContainer.topAnchor constraintEqualToAnchor:self.dockView.topAnchor constant:10],
-        [versionContainer.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10],
+        // Left version/progress stacks aligned beside Play button
+        [self.idleVersionStack.leadingAnchor constraintEqualToAnchor:self.launchCard.leadingAnchor constant:16],
+        [self.idleVersionStack.trailingAnchor constraintEqualToAnchor:self.playButton.leadingAnchor constant:-12],
+        [self.idleVersionStack.centerYAnchor constraintEqualToAnchor:self.playButton.centerYAnchor],
 
-        [self.versionTitleLabel.leadingAnchor constraintEqualToAnchor:versionContainer.leadingAnchor constant:12],
-        [self.versionTitleLabel.topAnchor constraintEqualToAnchor:versionContainer.topAnchor constant:6],
-        [self.versionTitleLabel.trailingAnchor constraintEqualToAnchor:self.detailsButton.leadingAnchor constant:-6],
-
-        [self.uuidPreviewLabel.leadingAnchor constraintEqualToAnchor:versionContainer.leadingAnchor constant:12],
-        [self.uuidPreviewLabel.trailingAnchor constraintEqualToAnchor:versionContainer.trailingAnchor constant:-12],
-        [self.uuidPreviewLabel.bottomAnchor constraintEqualToAnchor:versionContainer.bottomAnchor constant:-6],
-
-        [self.downloadStatusLabel.leadingAnchor constraintEqualToAnchor:versionContainer.leadingAnchor constant:12],
-        [self.downloadStatusLabel.topAnchor constraintEqualToAnchor:versionContainer.topAnchor constant:6],
-        [self.downloadStatusLabel.trailingAnchor constraintEqualToAnchor:self.detailsButton.leadingAnchor constant:-6],
-
-        [self.downloadProgressView.leadingAnchor constraintEqualToAnchor:versionContainer.leadingAnchor constant:12],
-        [self.downloadProgressView.trailingAnchor constraintEqualToAnchor:versionContainer.trailingAnchor constant:-12],
-        [self.downloadProgressView.bottomAnchor constraintEqualToAnchor:versionContainer.bottomAnchor constant:-10],
-
-        [self.detailsButton.trailingAnchor constraintEqualToAnchor:versionContainer.trailingAnchor constant:-10],
-        [self.detailsButton.topAnchor constraintEqualToAnchor:versionContainer.topAnchor constant:4],
-        [self.detailsButton.widthAnchor constraintGreaterThanOrEqualToConstant:52],
-
-        // Scrollable center grid
-        [centerScroll.topAnchor constraintEqualToAnchor:self.headerView.bottomAnchor],
-        [centerScroll.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
-        [centerScroll.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
-        [centerScroll.bottomAnchor constraintEqualToAnchor:self.dockView.topAnchor],
-
-        [cardsRow.topAnchor constraintEqualToAnchor:centerScroll.contentLayoutGuide.topAnchor constant:12],
-        [cardsRow.bottomAnchor constraintEqualToAnchor:centerScroll.contentLayoutGuide.bottomAnchor constant:-12],
-        [cardsRow.leadingAnchor constraintEqualToAnchor:centerScroll.contentLayoutGuide.leadingAnchor constant:12],
-        [cardsRow.trailingAnchor constraintEqualToAnchor:centerScroll.contentLayoutGuide.trailingAnchor constant:-12],
-        [cardsRow.widthAnchor constraintEqualToAnchor:centerScroll.frameLayoutGuide.widthAnchor constant:-24],
-        [leftCard.widthAnchor constraintEqualToAnchor:rightCard.widthAnchor multiplier:1.28],
+        [self.progressStack.leadingAnchor constraintEqualToAnchor:self.launchCard.leadingAnchor constant:14],
+        [self.progressStack.trailingAnchor constraintEqualToAnchor:self.playButton.leadingAnchor constant:-12],
+        [self.progressStack.centerYAnchor constraintEqualToAnchor:self.playButton.centerYAnchor],
     ]];
-}
-
-- (UIView *)buildEngineStatusCard {
-    UIView *card = [self makeCardView];
-
-    UILabel *cardTitle = [UILabel new];
-    cardTitle.translatesAutoresizingMaskIntoConstraints = NO;
-    cardTitle.text = @"Minecraft Java Edition 1.12.2";
-    cardTitle.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
-    cardTitle.textColor = [TLauncherHomeViewController textPrimary];
-
-    self.statusPillLabel = [UILabel new];
-    self.statusPillLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.statusPillLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
-    self.statusPillLabel.textAlignment = NSTextAlignmentCenter;
-    self.statusPillLabel.layer.cornerRadius = 6;
-    self.statusPillLabel.clipsToBounds = YES;
-
-    UILabel *rendererTitle = [self makeMutedLabel:@"ĐỒ HỌA"];
-    self.rendererValueLabel = [self makeMetricValueLabel:@"GL4ES 1.1.4"];
-    UIView *rendererTile = [self makeMetricTileWithTitleLabel:rendererTitle valueLabel:self.rendererValueLabel];
-
-    UILabel *ramTitle = [self makeMutedLabel:@"RAM JVM (CHẠM ĐỂ CHỈNH)"];
-    self.ramValueLabel = [self makeMetricValueLabel:@"Tự động"];
-    UIView *ramTile = [self makeMetricTileWithTitleLabel:ramTitle valueLabel:self.ramValueLabel];
-    ramTile.userInteractionEnabled = YES;
-    [ramTile addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(actionQuickPickRAM)]];
-
-    UILabel *jitTitle = [self makeMutedLabel:@"TRẠNG THÁI JIT"];
-    self.jitValueLabel = [self makeMetricValueLabel:@"Đang kiểm tra"];
-    UIView *jitTile = [self makeMetricTileWithTitleLabel:jitTitle valueLabel:self.jitValueLabel];
-
-    UILabel *layoutTitle = [self makeMutedLabel:@"BỐ CỤC PHÍM"];
-    UILabel *layoutValue = [self makeMetricValueLabel:@"Pojav Android (16 nút)"];
-    UIView *layoutTile = [self makeMetricTileWithTitleLabel:layoutTitle valueLabel:layoutValue];
-
-    UIStackView *row1 = [[UIStackView alloc] initWithArrangedSubviews:@[rendererTile, ramTile]];
-    row1.axis = UILayoutConstraintAxisHorizontal;
-    row1.spacing = 8;
-    row1.distribution = UIStackViewDistributionFillEqually;
-
-    UIStackView *row2 = [[UIStackView alloc] initWithArrangedSubviews:@[jitTile, layoutTile]];
-    row2.axis = UILayoutConstraintAxisHorizontal;
-    row2.spacing = 8;
-    row2.distribution = UIStackViewDistributionFillEqually;
-
-    UIStackView *metricsStack = [[UIStackView alloc] initWithArrangedSubviews:@[row1, row2]];
-    metricsStack.translatesAutoresizingMaskIntoConstraints = NO;
-    metricsStack.axis = UILayoutConstraintAxisVertical;
-    metricsStack.spacing = 8;
-
-    self.controlsResetButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.controlsResetButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.controlsResetButton setTitle:@"Khôi phục 16 phím Pojav Android mặc định" forState:UIControlStateNormal];
-    [self.controlsResetButton setTitleColor:[TLauncherHomeViewController textPrimary] forState:UIControlStateNormal];
-    self.controlsResetButton.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    self.controlsResetButton.backgroundColor = [TLauncherHomeViewController cardInsetBg];
-    self.controlsResetButton.layer.cornerRadius = 8;
-    self.controlsResetButton.layer.borderWidth = 1;
-    self.controlsResetButton.layer.borderColor = [TLauncherHomeViewController borderHairline].CGColor;
-    self.controlsResetButton.contentEdgeInsets = UIEdgeInsetsMake(7, 10, 7, 10);
-    [self.controlsResetButton addTarget:self action:@selector(actionResetAndroidControls) forControlEvents:UIControlEventTouchUpInside];
-
-    [card addSubview:cardTitle];
-    [card addSubview:self.statusPillLabel];
-    [card addSubview:metricsStack];
-    [card addSubview:self.controlsResetButton];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [cardTitle.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
-        [cardTitle.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
-
-        [self.statusPillLabel.centerYAnchor constraintEqualToAnchor:cardTitle.centerYAnchor],
-        [self.statusPillLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-        [self.statusPillLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:cardTitle.trailingAnchor constant:8],
-        [self.statusPillLabel.heightAnchor constraintEqualToConstant:22],
-        [self.statusPillLabel.widthAnchor constraintGreaterThanOrEqualToConstant:88],
-
-        [metricsStack.topAnchor constraintEqualToAnchor:cardTitle.bottomAnchor constant:12],
-        [metricsStack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
-        [metricsStack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-
-        [self.controlsResetButton.topAnchor constraintEqualToAnchor:metricsStack.bottomAnchor constant:12],
-        [self.controlsResetButton.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
-        [self.controlsResetButton.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14],
-    ]];
-
-    return card;
-}
-
-- (UIView *)buildMultiplayerGuideCard {
-    UIView *card = [self makeCardView];
-
-    UILabel *title = [UILabel new];
-    title.translatesAutoresizingMaskIntoConstraints = NO;
-    title.text = @"Kết nối Server PC (Netty 340)";
-    title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
-    title.textColor = [TLauncherHomeViewController textPrimary];
-
-    UILabel *sub = [UILabel new];
-    sub.translatesAutoresizingMaskIntoConstraints = NO;
-    sub.text = @"Chơi chung Server Java 1.12.2 bằng tên Offline — không cần tài khoản Microsoft.";
-    sub.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
-    sub.textColor = [TLauncherHomeViewController textMuted];
-    sub.numberOfLines = 0;
-
-    UIView *step1 = [self makeStepRowWithNumber:@"1" text:@"Nhập Tên Offline (3–16 ký tự) vào ô bên dưới."];
-    UIView *step2 = [self makeStepRowWithNumber:@"2" text:@"Bấm CHƠI GAME (lần đầu tự tải bản gốc 1.12.2)."];
-    UIView *step3 = [self makeStepRowWithNumber:@"3" text:@"Vào Multiplayer → Direct Connect / Add Server → nhập IP:Port Server PC."];
-
-    UIStackView *steps = [[UIStackView alloc] initWithArrangedSubviews:@[step1, step2, step3]];
-    steps.translatesAutoresizingMaskIntoConstraints = NO;
-    steps.axis = UILayoutConstraintAxisVertical;
-    steps.spacing = 8;
-
-    [card addSubview:title];
-    [card addSubview:sub];
-    [card addSubview:steps];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [title.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
-        [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
-        [title.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-
-        [sub.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:4],
-        [sub.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
-        [sub.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-
-        [steps.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:12],
-        [steps.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
-        [steps.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-        [steps.bottomAnchor constraintLessThanOrEqualToAnchor:card.bottomAnchor constant:-14],
-    ]];
-
-    return card;
 }
 
 - (UIButton *)makeToolbarButtonWithTitle:(NSString *)title icon:(NSString *)symbolName action:(SEL)selector {
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.backgroundColor = [TLauncherHomeViewController cardInsetBg];
-    button.layer.cornerRadius = 8;
+    button.layer.cornerRadius = 7;
     button.layer.borderWidth = 1;
     button.layer.borderColor = [TLauncherHomeViewController borderHairline].CGColor;
     button.tintColor = [TLauncherHomeViewController textPrimary];
     [button setTitle:title forState:UIControlStateNormal];
     [button setTitleColor:[TLauncherHomeViewController textPrimary] forState:UIControlStateNormal];
-    button.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIFontWeightSemibold];
+    button.titleLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightSemibold];
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:11.5 weight:UIImageSymbolWeightSemibold];
     [button setImage:[UIImage systemImageNamed:symbolName withConfiguration:cfg] forState:UIControlStateNormal];
-    button.contentEdgeInsets = UIEdgeInsetsMake(6, 10, 6, 10);
+    button.contentEdgeInsets = UIEdgeInsetsMake(5, 9, 5, 9);
     button.imageEdgeInsets = UIEdgeInsetsMake(0, -3, 0, 3);
     [button addTarget:self action:selector forControlEvents:UIControlEventTouchUpInside];
     return button;
 }
 
-- (UIView *)makeCardView {
-    UIView *card = [UIView new];
-    card.translatesAutoresizingMaskIntoConstraints = NO;
-    card.backgroundColor = [TLauncherHomeViewController surfaceSlate];
-    card.layer.cornerRadius = 12;
-    card.layer.borderWidth = 1;
-    card.layer.borderColor = [TLauncherHomeViewController borderHairline].CGColor;
-    return card;
-}
+#pragma mark - Keyboard Avoidance (Landscape iPhone)
 
-- (UILabel *)makeMutedLabel:(NSString *)text {
-    UILabel *label = [UILabel new];
-    label.translatesAutoresizingMaskIntoConstraints = NO;
-    label.text = text;
-    label.font = [UIFont systemFontOfSize:10 weight:UIFontWeightBold];
-    label.textColor = [TLauncherHomeViewController textMuted];
-    return label;
-}
+- (void)handleKeyboardFrameNotification:(NSNotification *)note {
+    NSDictionary *info = note.userInfo;
+    CGRect kbEndScreen = [info[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+    CGRect kbInView = [self.view convertRect:kbEndScreen fromView:nil];
+    NSTimeInterval duration = [info[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    NSInteger curve = [info[UIKeyboardAnimationCurveUserInfoKey] integerValue];
 
-- (UILabel *)makeMetricValueLabel:(NSString *)text {
-    UILabel *label = [UILabel new];
-    label.translatesAutoresizingMaskIntoConstraints = NO;
-    label.text = text;
-    label.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-    label.textColor = [TLauncherHomeViewController textPrimary];
-    return label;
-}
+    CGFloat viewHeight = self.view.bounds.size.height;
+    CGFloat kbTopY = CGRectGetMinY(kbInView);
 
-- (UIView *)makeMetricTileWithTitleLabel:(UILabel *)titleLabel valueLabel:(UILabel *)valueLabel {
-    UIView *tile = [UIView new];
-    tile.translatesAutoresizingMaskIntoConstraints = NO;
-    tile.backgroundColor = [TLauncherHomeViewController cardInsetBg];
-    tile.layer.cornerRadius = 8;
-    tile.layer.borderWidth = 1;
-    tile.layer.borderColor = [TLauncherHomeViewController borderHairline].CGColor;
-    [tile addSubview:titleLabel];
-    [tile addSubview:valueLabel];
-    [NSLayoutConstraint activateConstraints:@[
-        [titleLabel.topAnchor constraintEqualToAnchor:tile.topAnchor constant:8],
-        [titleLabel.leadingAnchor constraintEqualToAnchor:tile.leadingAnchor constant:10],
-        [titleLabel.trailingAnchor constraintEqualToAnchor:tile.trailingAnchor constant:-10],
-        [valueLabel.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:3],
-        [valueLabel.leadingAnchor constraintEqualToAnchor:tile.leadingAnchor constant:10],
-        [valueLabel.trailingAnchor constraintEqualToAnchor:tile.trailingAnchor constant:-10],
-        [valueLabel.bottomAnchor constraintEqualToAnchor:tile.bottomAnchor constant:-8],
-    ]];
-    return tile;
-}
-
-- (UIView *)makeStepRowWithNumber:(NSString *)num text:(NSString *)text {
-    UIView *row = [UIView new];
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-
-    UILabel *badge = [UILabel new];
-    badge.translatesAutoresizingMaskIntoConstraints = NO;
-    badge.text = num;
-    badge.textAlignment = NSTextAlignmentCenter;
-    badge.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightBold];
-    badge.textColor = [TLauncherHomeViewController emeraldBright];
-    badge.backgroundColor = [[TLauncherHomeViewController emeraldPrimary] colorWithAlphaComponent:0.16];
-    badge.layer.cornerRadius = 6;
-    badge.clipsToBounds = YES;
-
-    UILabel *desc = [UILabel new];
-    desc.translatesAutoresizingMaskIntoConstraints = NO;
-    desc.text = text;
-    desc.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-    desc.textColor = [TLauncherHomeViewController textPrimary];
-    desc.numberOfLines = 0;
-
-    [row addSubview:badge];
-    [row addSubview:desc];
-    [NSLayoutConstraint activateConstraints:@[
-        [badge.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
-        [badge.topAnchor constraintEqualToAnchor:row.topAnchor constant:1],
-        [badge.widthAnchor constraintEqualToConstant:22],
-        [badge.heightAnchor constraintEqualToConstant:22],
-
-        [desc.leadingAnchor constraintEqualToAnchor:badge.trailingAnchor constant:8],
-        [desc.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-        [desc.topAnchor constraintEqualToAnchor:row.topAnchor],
-        [desc.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
-    ]];
-    return row;
-}
-
-#pragma mark - Offline Accounts & Dashboard State
-
-+ (NSString *)offlineUUIDForUsername:(NSString *)username {
-    if (username.length == 0) {
-        return @"";
+    if (kbTopY >= viewHeight - 10.0) {
+        [self animateCardVerticalOffset:0.0 duration:duration curve:curve];
+        return;
     }
-    NSString *source = [@"OfflinePlayer:" stringByAppendingString:username];
-    const char *utf8 = source.UTF8String;
-    unsigned char digest[CC_MD5_DIGEST_LENGTH];
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    CC_MD5(utf8, (CC_LONG)strlen(utf8), digest);
-#pragma clang diagnostic pop
-    digest[6] = (digest[6] & 0x0f) | 0x30;
-    digest[8] = (digest[8] & 0x3f) | 0x80;
-    return [NSString stringWithFormat:
-            @"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-            digest[0], digest[1], digest[2], digest[3],
-            digest[4], digest[5],
-            digest[6], digest[7],
-            digest[8], digest[9],
-            digest[10], digest[11], digest[12], digest[13], digest[14], digest[15]];
+
+    [self.view layoutIfNeeded];
+    CGFloat headerBottom = CGRectGetMaxY(self.headerView.frame);
+    CGFloat safeBottom = self.view.safeAreaInsets.bottom;
+    CGFloat stageNaturalCenterY = (headerBottom + (viewHeight - safeBottom)) * 0.5;
+    CGFloat cardHeight = self.launchCard.bounds.size.height;
+
+    // Keep at least the Username row (top 68pt of launchCard) completely clear above the keyboard
+    CGFloat maxAllowedCardBottom = kbTopY - 8.0;
+    CGFloat desiredCenterY = maxAllowedCardBottom - (cardHeight * 0.5);
+    CGFloat minCenterForHeader = headerBottom + 6.0 + (cardHeight * 0.5);
+
+    // If screen is extra short (e.g., 320pt SE landscape), pin card top right under header so Username box never leaves screen
+    CGFloat finalCenterY;
+    if (desiredCenterY < minCenterForHeader) {
+        finalCenterY = minCenterForHeader;
+    } else {
+        finalCenterY = MIN(stageNaturalCenterY, desiredCenterY);
+    }
+    CGFloat offset = finalCenterY - stageNaturalCenterY;
+    [self animateCardVerticalOffset:MIN(0.0, offset) duration:duration curve:curve];
 }
+
+- (void)handleKeyboardHideNotification:(NSNotification *)note {
+    NSDictionary *info = note.userInfo;
+    NSTimeInterval duration = [info[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    NSInteger curve = [info[UIKeyboardAnimationCurveUserInfoKey] integerValue];
+    [self animateCardVerticalOffset:0.0 duration:duration curve:curve];
+}
+
+- (void)animateCardVerticalOffset:(CGFloat)offset duration:(NSTimeInterval)duration curve:(NSInteger)curve {
+    self.cardCenterYConstraint.constant = offset;
+    UIViewAnimationOptions options = (UIViewAnimationOptions)((curve << 16) | UIViewAnimationOptionBeginFromCurrentState);
+    [UIView animateWithDuration:(duration > 0 ? duration : 0.25)
+                          delay:0
+                        options:options
+                     animations:^{
+        [self.view layoutIfNeeded];
+    } completion:nil];
+}
+
+#pragma mark - Offline Accounts & Version Status
 
 + (BOOL)isValidOfflineUsername:(NSString *)username {
     if (username.length < 3 || username.length > 16) {
@@ -728,60 +522,15 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     return names;
 }
 
-- (void)usernameTextChanged:(UITextField *)sender {
-    [self updateUUIDPreview];
-}
-
-- (void)updateUUIDPreview {
-    NSString *trimmed = [self.usernameField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
-    if ([TLauncherHomeViewController isValidOfflineUsername:trimmed]) {
-        self.uuidPreviewLabel.text = [NSString stringWithFormat:@"Offline UUID: %@", [TLauncherHomeViewController offlineUUIDForUsername:trimmed]];
-        self.uuidPreviewLabel.textColor = [TLauncherHomeViewController textMuted];
-    } else {
-        self.uuidPreviewLabel.text = @"Tên hợp lệ: 3–16 ký tự (A-Z, 0-9, _)";
-        self.uuidPreviewLabel.textColor = [TLauncherHomeViewController amberAccent];
-    }
-}
-
-- (void)refreshDashboardState {
-    // Ensure fixed 1.12.2 profile stays selected
+- (void)refreshVersionSubtitle {
     [PLProfiles updateCurrent];
-
-    // Check local 1.12.2 jar presence
     NSString *gameDir = getenv("GAME_DIR") ? @(getenv("GAME_DIR")) : @"";
     NSString *jarPath = [NSString stringWithFormat:@"%@/versions/%@/%@.jar", gameDir, PovaTargetVersion, PovaTargetVersion];
     NSString *jsonPath = [NSString stringWithFormat:@"%@/versions/%@/%@.json", gameDir, PovaTargetVersion, PovaTargetVersion];
     BOOL installed = [NSFileManager.defaultManager fileExistsAtPath:jarPath] && [NSFileManager.defaultManager fileExistsAtPath:jsonPath];
-    if (installed) {
-        self.statusPillLabel.text = @"  ĐÃ SẴN SÀNG  ";
-        self.statusPillLabel.backgroundColor = [[TLauncherHomeViewController emeraldPrimary] colorWithAlphaComponent:0.20];
-        self.statusPillLabel.textColor = [TLauncherHomeViewController emeraldBright];
-    } else {
-        self.statusPillLabel.text = @"  SẼ TẢI 1.12.2  ";
-        self.statusPillLabel.backgroundColor = [[TLauncherHomeViewController amberAccent] colorWithAlphaComponent:0.20];
-        self.statusPillLabel.textColor = [TLauncherHomeViewController amberAccent];
-    }
-
-    // Renderer
-    NSString *renderer = getPrefObject(@"video.renderer") ?: @"libgl4es_114.dylib";
-    if ([renderer isEqualToString:@ RENDERER_NAME_GL4ES] || [renderer isEqualToString:@"auto"]) {
-        self.rendererValueLabel.text = @"GL4ES 1.1.4 (Tối ưu 1.12.2)";
-    } else {
-        self.rendererValueLabel.text = renderer;
-    }
-
-    // RAM
-    if (getPrefBool(@"java.auto_ram")) {
-        self.ramValueLabel.text = @"Tự động";
-    } else {
-        NSInteger mb = getPrefInt(@"java.allocated_memory");
-        self.ramValueLabel.text = [NSString stringWithFormat:@"%ld MB", (long)mb];
-    }
-
-    // JIT
-    BOOL jit = isJITEnabled(false);
-    self.jitValueLabel.text = jit ? @"Đã bật JIT" : @"Chờ bật khi vào game";
-    self.jitValueLabel.textColor = jit ? [TLauncherHomeViewController emeraldBright] : [TLauncherHomeViewController textPrimary];
+    self.versionSubtitleLabel.text = installed
+        ? @"Offline • Đã sẵn sàng (Server PC: Multiplayer)"
+        : @"Offline • Sẽ tự tải 1.12.2 khi bấm CHƠI GAME";
 }
 
 - (void)dismissKeyboard {
@@ -793,7 +542,7 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     return YES;
 }
 
-#pragma mark - Header & Quick Actions
+#pragma mark - Header & Account Actions
 
 - (void)actionOpenControls {
     CustomControlsViewController *vc = [[CustomControlsViewController alloc] init];
@@ -807,18 +556,23 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     [self presentViewController:vc animated:YES completion:nil];
 }
 
-- (void)actionResetAndroidControls {
-    if (!getenv("AME_HOME")) {
+- (void)actionHoldResetControls:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) {
         return;
     }
-    NSString *defaultCtrlPath = [NSString stringWithFormat:@"%s/controlmap/default.json", getenv("AME_HOME")];
-    [NSFileManager.defaultManager removeItemAtPath:defaultCtrlPath error:nil];
-    generateAndSaveDefaultControl();
-    setPrefObject(@"control.default_ctrl", @"default.json");
-    [self.controlsResetButton setTitle:@"Đã khôi phục 16 phím Pojav Android ✓" forState:UIControlStateNormal];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self.controlsResetButton setTitle:@"Khôi phục 16 phím Pojav Android mặc định" forState:UIControlStateNormal];
-    });
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Điều khiển Pojav Android"
+                                                                   message:@"Khôi phục bộ 16 nút mặc định chuẩn PojavLauncher Android?"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Khôi phục mặc định" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        if (getenv("AME_HOME")) {
+            NSString *defaultCtrlPath = [NSString stringWithFormat:@"%s/controlmap/default.json", getenv("AME_HOME")];
+            [NSFileManager.defaultManager removeItemAtPath:defaultCtrlPath error:nil];
+            generateAndSaveDefaultControl();
+            setPrefObject(@"control.default_ctrl", @"default.json");
+        }
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)actionOpenJarInstaller {
@@ -875,45 +629,17 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     [self presentViewController:activityVC animated:YES completion:nil];
 }
 
-- (void)actionQuickPickRAM {
-    NSUInteger maxMB = (NSUInteger)((NSProcessInfo.processInfo.physicalMemory / 1048576.0) * 0.85);
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Chọn mức RAM JVM"
-                                                                   message:[NSString stringWithFormat:@"Thiết bị hỗ trợ tối đa ~%lu MB", (unsigned long)maxMB]
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Tự động (Auto RAM)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        setPrefBool(@"java.auto_ram", YES);
-        [self refreshDashboardState];
-    }]];
-    NSArray<NSNumber *> *presets = @[@(512), @(768), @(1024), @(1536), @(2048)];
-    for (NSNumber *preset in presets) {
-        if (preset.unsignedIntegerValue <= maxMB) {
-            [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%d MB", preset.intValue]
-                                                      style:UIAlertActionStyleDefault
-                                                    handler:^(UIAlertAction * _Nonnull action) {
-                setPrefBool(@"java.auto_ram", NO);
-                setPrefInt(@"java.allocated_memory", preset.integerValue);
-                [self refreshDashboardState];
-            }]];
-        }
-    }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
-    sheet.popoverPresentationController.sourceView = self.ramValueLabel;
-    sheet.popoverPresentationController.sourceRect = self.ramValueLabel.bounds;
-    [self presentViewController:sheet animated:YES completion:nil];
-}
-
 - (void)actionPickSavedOfflineAccount:(UIButton *)sender {
     [self dismissKeyboard];
     NSArray<NSString *> *accounts = [self savedOfflineUsernames];
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Tài khoản Offline đã lưu"
-                                                                   message:(accounts.count == 0 ? @"Chưa có tài khoản offline nào. Hãy nhập tên và bấm CHƠI GAME." : nil)
+                                                                   message:(accounts.count == 0 ? @"Chưa có tài khoản đã lưu. Hãy nhập tên và bấm CHƠI GAME." : nil)
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
     for (NSString *name in accounts) {
         [sheet addAction:[UIAlertAction actionWithTitle:name style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
             [BaseAuthenticator loadSavedName:name];
             setPrefObject(@"internal.selected_account", name);
             self.usernameField.text = name;
-            [self updateUUIDPreview];
         }]];
     }
     NSString *currentName = [self.usernameField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -928,7 +654,6 @@ static NSString * const PovaTargetVersion = @"1.12.2";
                 setPrefObject(@"internal.selected_account", @"");
             }
             self.usernameField.text = @"";
-            [self updateUUIDPreview];
         }]];
     }
     [sheet addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
@@ -945,7 +670,7 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     NSString *rawName = self.usernameField.text ?: @"";
     NSString *trimmed = [rawName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (![TLauncherHomeViewController isValidOfflineUsername:trimmed]) {
-        showDialog(@"Tên không hợp lệ", @"Vui lòng nhập Tên nhân vật Offline dài 3–16 ký tự (chỉ gồm chữ cái A–Z, số 0–9 và dấu gạch dưới _).");
+        showDialog(@"Tên không hợp lệ", @"Tên nhân vật Offline phải dài 3–16 ký tự (chỉ gồm chữ A–Z, số 0–9 và dấu gạch dưới _).");
         [self.usernameField becomeFirstResponder];
         return;
     }
@@ -953,15 +678,13 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     LocalAuthenticator *auth = [[LocalAuthenticator alloc] initWithInput:trimmed];
     [auth loginWithCallback:^(id status, BOOL success) {
         if (!success) {
-            NSString *msg = [status isKindOfClass:NSError.class] ? [(NSError *)status localizedDescription] : @"Không thể tạo tài khoản offline.";
+            NSString *msg = [status isKindOfClass:NSError.class] ? [(NSError *)status localizedDescription] : @"Không thể lưu tài khoản offline.";
             showDialog(@"Lỗi đăng nhập", msg);
             return;
         }
 
         setPrefObject(@"internal.selected_account", trimmed);
         self.usernameField.text = trimmed;
-        [self updateUUIDPreview];
-
         [self startDownloadAndLaunch1122];
     }];
 }
@@ -991,7 +714,7 @@ static NSString * const PovaTargetVersion = @"1.12.2";
             weakSelf.progressVC = nil;
             weakSelf.downloadTask = nil;
             [weakSelf setDownloadUIActive:NO];
-            [weakSelf refreshDashboardState];
+            [weakSelf refreshVersionSubtitle];
         });
     };
 
@@ -1027,13 +750,10 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     self.usernameField.enabled = !active;
     self.accountListButton.enabled = !active;
 
-    self.versionTitleLabel.hidden = active;
-    self.uuidPreviewLabel.hidden = active;
-    self.downloadProgressView.hidden = !active;
-    self.downloadStatusLabel.hidden = !active;
-    self.detailsButton.hidden = !active;
+    self.idleVersionStack.hidden = active;
+    self.progressStack.hidden = !active;
     if (active) {
-        self.downloadStatusLabel.text = @"Đang chuẩn bị Minecraft 1.12.2...";
+        self.downloadStatusLabel.text = @"Đang kiểm tra / tải 1.12.2...";
     }
     UIApplication.sharedApplication.idleTimerDisabled = active;
 }
@@ -1098,7 +818,7 @@ static NSString * const PovaTargetVersion = @"1.12.2";
         self.progressVC = nil;
         self.downloadTask = nil;
         [self setDownloadUIActive:NO];
-        [self refreshDashboardState];
+        [self refreshVersionSubtitle];
 
         if (metadata) {
             UIWindow *targetWindow = self.view.window ?: UIWindow.mainWindow;
@@ -1109,7 +829,80 @@ static NSString * const PovaTargetVersion = @"1.12.2";
     });
 }
 
-#pragma mark - JIT Check
+#pragma mark - JIT Handling (StikJIT / SideStore / AltKit / Cancel-Safe)
+
+- (void)tryAltKitEnableJITSilently {
+    [ALTServerManager.sharedManager startDiscovering];
+    [ALTServerManager.sharedManager autoconnectWithCompletionHandler:^(ALTServerConnection *connection, NSError *error) {
+        if (error || !connection) {
+            return;
+        }
+        [connection enableUnsignedCodeExecutionWithCompletionHandler:^(BOOL success, NSError *enableErr) {
+            [connection disconnect];
+            if (success) {
+                [ALTServerManager.sharedManager stopDiscovering];
+            }
+        }];
+    }];
+}
+
+- (NSURL *)jitHelperURLForDevice {
+    if (getEntitlementValue(@"jb.pmap_cs.custom_trust")) {
+        return [NSURL URLWithString:[NSString stringWithFormat:@"apple-magnifier://enable-jit?bundle-id=%@", NSBundle.mainBundle.bundleIdentifier]];
+    }
+    if (@available(iOS 17.4, *)) {
+        NSString *scriptDataString = @"";
+        if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
+            NSData *scriptData = [NSData dataWithContentsOfFile:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"UniversalJIT26.js"]];
+            if (scriptData) {
+                scriptDataString = [@"&script-data=" stringByAppendingString:[scriptData base64EncodedStringWithOptions:0]];
+            }
+        }
+        return [NSURL URLWithString:[NSString stringWithFormat:@"stikjit://enable-jit?bundle-id=%@&pid=%d%@", NSBundle.mainBundle.bundleIdentifier, getpid(), scriptDataString]];
+    }
+    return [NSURL URLWithString:[NSString stringWithFormat:@"sidestore://sidejit-enable?pid=%d", getpid()]];
+}
+
+- (void)presentJITPromptAlert {
+    if (self.cancelledJITWait || isJITEnabled(false)) {
+        return;
+    }
+
+    BOOL hasTrollStoreJIT = getEntitlementValue(@"jb.pmap_cs.custom_trust");
+    NSString *message = hasTrollStoreJIT
+        ? @"Hãy bật URL Scheme trong cài đặt TrollStore cho PovaLauncher để cấp quyền JIT tự động."
+        : @"iOS chặn Java chạy Minecraft nếu chưa cấp quyền JIT (Just-In-Time).\n\n"
+          @"Cách bật nhanh:\n"
+          @"1. Mở StikJIT / StikDebug (hoặc SideStore / AltServer trên PC) rồi cấp JIT cho PovaLauncher.\n"
+          @"2. Quay lại app này, game sẽ tự động mở.\n\n"
+          @"(Nếu cài Sideloadly thường chưa gắn PC/StikJIT, bấm Hủy để chuẩn bị JIT trước.)";
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Cần bật JIT để chạy Java"
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Mở StikJIT / Hỗ trợ JIT" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [UIApplication.sharedApplication openURL:[weakSelf jitHelperURLForDevice] options:@{} completionHandler:nil];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [weakSelf presentJITPromptAlert];
+        });
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Thử AltServer Wi-Fi" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [weakSelf tryAltKitEnableJITSilently];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [weakSelf presentJITPromptAlert];
+        });
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
+        weakSelf.cancelledJITWait = YES;
+        weakSelf.jitWaitAlert = nil;
+        [ALTServerManager.sharedManager stopDiscovering];
+    }]];
+
+    self.jitWaitAlert = alert;
+    [self presentViewController:alert animated:YES completion:nil];
+}
 
 - (void)runAfterJITEnabled:(void(^)(void))handler {
     if (isJITEnabled(false)) {
@@ -1118,42 +911,35 @@ static NSString * const PovaTargetVersion = @"1.12.2";
         return;
     }
 
-    BOOL hasTrollStoreJIT = getEntitlementValue(@"jb.pmap_cs.custom_trust");
-    if (hasTrollStoreJIT) {
-        NSURL *jitURL = [NSURL URLWithString:[NSString stringWithFormat:@"apple-magnifier://enable-jit?bundle-id=%@", NSBundle.mainBundle.bundleIdentifier]];
-        [UIApplication.sharedApplication openURL:jitURL options:@{} completionHandler:nil];
-    } else if (getPrefBool(@"debug.debug_skip_wait_jit")) {
+    if (getPrefBool(@"debug.debug_skip_wait_jit")) {
         NSLog(@"[PovaLauncher] Debug skipped waiting for JIT.");
         handler();
         return;
-    } else if (@available(iOS 17.4, *)) {
-        NSString *scriptDataString = @"";
-        if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
-            NSData *scriptData = [NSData dataWithContentsOfFile:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"UniversalJIT26.js"]];
-            if (scriptData) {
-                scriptDataString = [@"&script-data=" stringByAppendingString:[scriptData base64EncodedStringWithOptions:0]];
-            }
-        }
-        NSString *stikURL = [NSString stringWithFormat:@"stikjit://enable-jit?bundle-id=%@&pid=%d%@", NSBundle.mainBundle.bundleIdentifier, getpid(), scriptDataString];
-        [UIApplication.sharedApplication openURL:[NSURL URLWithString:stikURL] options:@{} completionHandler:nil];
-    } else {
-        NSString *sideURL = [NSString stringWithFormat:@"sidestore://sidejit-enable?pid=%d", getpid()];
-        [UIApplication.sharedApplication openURL:[NSURL URLWithString:sideURL] options:@{} completionHandler:nil];
     }
 
-    self.jitWaitAlert = [UIAlertController alertControllerWithTitle:localize(@"launcher.wait_jit.title", nil)
-                                                              message:(hasTrollStoreJIT ? localize(@"launcher.wait_jit_trollstore.message", nil) : localize(@"launcher.wait_jit.message", nil))
-                                                       preferredStyle:UIAlertControllerStyleAlert];
-    [self presentViewController:self.jitWaitAlert animated:YES completion:nil];
+    self.cancelledJITWait = NO;
+    NSURL *helperURL = [self jitHelperURLForDevice];
+    [UIApplication.sharedApplication openURL:helperURL options:@{} completionHandler:nil];
+    [self tryAltKitEnableJITSilently];
+    [self presentJITPromptAlert];
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        while (!isJITEnabled(false)) {
+        while (!isJITEnabled(false) && !weakSelf.cancelledJITWait) {
             usleep(1000 * 200);
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            [weakSelf.jitWaitAlert dismissViewControllerAnimated:YES completion:handler];
+            [ALTServerManager.sharedManager stopDiscovering];
+            if (weakSelf.cancelledJITWait) {
+                return;
+            }
+            UIAlertController *currentAlert = weakSelf.jitWaitAlert;
             weakSelf.jitWaitAlert = nil;
+            if (currentAlert && currentAlert.presentingViewController) {
+                [currentAlert dismissViewControllerAnimated:YES completion:handler];
+            } else {
+                handler();
+            }
         });
     });
 }

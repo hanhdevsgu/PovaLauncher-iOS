@@ -66,8 +66,8 @@
 "launcher.menu.custom_controls" = "Tùy chỉnh điều khiển";
 "launcher.menu.install_jar" = "Cài đặt tệp .jar";
 
-"launcher.wait_jit.title" = "Đang đợi JIT";
-"launcher.wait_jit.message" = "Amethyst phụ thuộc vào JIT để Java hoạt động ở mức tối đa hiệu năng.";
+"launcher.wait_jit.title" = "Cần bật JIT";
+"launcher.wait_jit.message" = "PovaLauncher cần iOS cấp quyền JIT để chạy Java (Minecraft 1.12.2).\n\nHãy mở StikJIT / StikDebug (hoặc SideStore / AltServer trên PC) để bật JIT cho PovaLauncher rồi quay lại.";
 
 "login.error.username.outOfRange" = "Tên người dùng phải có từ 3 đến 16 kí tự";
 
