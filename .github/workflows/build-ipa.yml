@@ -21,10 +21,10 @@ jobs:
           brew update
           brew install cmake ldid make
 
-      - name: Setup Temurin JDK 8
-        uses: actions/setup-java@v4
+      - name: Setup Azul Zulu JDK 8 (native arm64)
+        uses: actions/setup-java@v5
         with:
-          distribution: 'temurin'
+          distribution: 'zulu'
           java-version: '8'
 
       - name: Build PovaLauncher Standard IPA (Sideload / AltStore / SideStore / LiveContainer)
