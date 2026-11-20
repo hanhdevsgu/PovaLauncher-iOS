@@ -68,20 +68,22 @@ static PLProfiles* current;
         self.profileDict = PLProfiles.defaultProfiles;
         [self save];
     } else {
-        NSMutableDictionary *profiles = self.profileDict[@"profiles"];
+        NSMutableDictionary *rootDict = (NSMutableDictionary *)self.profileDict;
+        NSMutableDictionary *profiles = rootDict[@"profiles"];
         if (![profiles isKindOfClass:NSMutableDictionary.class]) {
             profiles = PLProfiles.defaultProfiles[@"profiles"];
-            self.profileDict[@"profiles"] = profiles;
+            rootDict[@"profiles"] = profiles;
         }
         if (!profiles[@"1.12.2"] || ![profiles[@"1.12.2"][@"lastVersionId"] isEqualToString:@"1.12.2"]) {
             profiles[@"1.12.2"] = @{
                 @"name": @"1.12.2",
                 @"lastVersionId": @"1.12.2"
             }.mutableCopy;
-            self.profileDict[@"selectedProfile"] = @"1.12.2";
+            rootDict[@"selectedProfile"] = @"1.12.2";
             [self save];
-        } else if (![self.profileDict[@"selectedProfile"] isEqualToString:@"1.12.2"]) {
-            self.profileDict[@"selectedProfile"] = @"1.12.2";
+        } else if (![rootDict[@"selectedProfile"] isKindOfClass:NSString.class] ||
+                   ![(NSString *)rootDict[@"selectedProfile"] isEqualToString:@"1.12.2"]) {
+            rootDict[@"selectedProfile"] = @"1.12.2";
             [self save];
         }
     }
