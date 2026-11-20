@@ -1,0 +1,91 @@
+name: Build PovaLauncher iOS IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build PovaLauncher IPA (arm64 / JRE8 / 1.12.2)
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout source & submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          brew update
+          brew install cmake ldid make
+
+      - name: Setup Temurin JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '8'
+
+      - name: Build PovaLauncher Standard IPA (Sideload / AltStore / SideStore / LiveContainer)
+        run: |
+          export PATH="/opt/homebrew/opt/make/libexec/gnubin:/opt/homebrew/bin:$PATH"
+          SDKPATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "Using SDKPATH=$SDKPATH BOOTJDK=$JAVA_HOME/bin"
+          gmake -j"$(sysctl -n hw.ncpu)" \
+            RELEASE=1 \
+            PLATFORM=2 \
+            BOOTJDK="$JAVA_HOME/bin" \
+            SDKPATH="$SDKPATH" \
+            native dep_mg java jre assets payload package
+
+      - name: Package PovaLauncher TrollStore TIPA
+        run: |
+          export PATH="/opt/homebrew/opt/make/libexec/gnubin:/opt/homebrew/bin:$PATH"
+          SDKPATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          gmake -j"$(sysctl -n hw.ncpu)" \
+            RELEASE=1 \
+            PLATFORM=2 \
+            TROLLSTORE_JIT_ENT=1 \
+            BOOTJDK="$JAVA_HOME/bin" \
+            SDKPATH="$SDKPATH" \
+            payload package
+
+      - name: Verify compiled IPA payload integrity
+        run: |
+          set -euo pipefail
+          IPA_FILE=$(ls artifacts/com.povalauncher.ios-*-ios.ipa | head -n1)
+          TIPA_FILE=$(ls artifacts/com.povalauncher.ios-*-ios-trollstore.tipa | head -n1)
+          echo "Verifying $IPA_FILE and $TIPA_FILE"
+          rm -rf /tmp/pova-audit && mkdir -p /tmp/pova-audit
+          unzip -q "$IPA_FILE" -d /tmp/pova-audit
+          APP="/tmp/pova-audit/Payload/PovaLauncher.app"
+          test -f "$APP/PovaLauncher"
+          file "$APP/PovaLauncher" | grep -q "Mach-O 64-bit executable arm64"
+          test -d "$APP/java_runtimes/java-8-openjdk"
+          test ! -d "$APP/java_runtimes/java-17-openjdk"
+          test ! -d "$APP/java_runtimes/java-21-openjdk"
+          test ! -d "$APP/java_runtimes/java-25-openjdk"
+          test -f "$APP/Frameworks/libgl4es_114.dylib"
+          plutil -convert json -o /tmp/pova-info.json "$APP/Info.plist"
+          python3 - <<'PY'
+          import json
+          info = json.load(open('/tmp/pova-info.json'))
+          assert info['CFBundleIdentifier'] == 'com.povalauncher.ios', info['CFBundleIdentifier']
+          assert info['CFBundleExecutable'] == 'PovaLauncher', info['CFBundleExecutable']
+          assert info['CFBundleDisplayName'] == 'PovaLauncher', info['CFBundleDisplayName']
+          assert 'UIInterfaceOrientationPortrait' not in info['UISupportedInterfaceOrientations'], info['UISupportedInterfaceOrientations']
+          print('Info.plist audit PASSED')
+          PY
+
+      - name: Upload PovaLauncher IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PovaLauncher-ios-ipa
+          path: artifacts/com.povalauncher.ios-*-ios.ipa
+
+      - name: Upload PovaLauncher TrollStore TIPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PovaLauncher-ios-trollstore-tipa
+          path: artifacts/com.povalauncher.ios-*-ios-trollstore.tipa
