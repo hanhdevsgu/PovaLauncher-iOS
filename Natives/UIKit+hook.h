@@ -20,7 +20,16 @@ extern NSNotificationName UIPresentationControllerPresentationTransitionWillBegi
 @end
 
 // private functions
-extern BOOL _UISolariumEnabled(void) __attribute__((weak_import));
+#include <dlfcn.h>
+static inline BOOL pova_UISolariumEnabled(void) {
+    typedef BOOL (*SolariumFn)(void);
+    static SolariumFn fn = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (SolariumFn)dlsym(RTLD_DEFAULT, "_UISolariumEnabled");
+    });
+    return fn ? fn() : NO;
+}
 
 @interface UIBarButtonItem(private)
 - (UIView *)view;

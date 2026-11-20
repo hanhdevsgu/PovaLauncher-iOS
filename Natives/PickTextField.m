@@ -51,7 +51,7 @@
 }
 
 - (BOOL)prefersPopoverPresentation {
-    BOOL hasLiquidGlass = _UISolariumEnabled && _UISolariumEnabled();
+    BOOL hasLiquidGlass = pova_UISolariumEnabled();
     return hasLiquidGlass || NSProcessInfo.processInfo.isMacCatalystApp;
 }
 
